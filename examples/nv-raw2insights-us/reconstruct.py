@@ -39,9 +39,12 @@ DEFAULT_OUTPUT = Path("nv_raw2insights_us_reconstructed.png")
 DEFAULT_PIPELINE = HERE / "pipeline.yaml"
 
 
-def ext_to_imshow_mm(ext):
-    """openh-rf [xmin, xmax, ymin, ymax, zmin, zmax] (m) -> mpl [left, right, bottom, top] (mm)."""
-    return [ext[0] * 1e3, ext[1] * 1e3, ext[5] * 1e3, ext[4] * 1e3]
+def coords_to_imshow_mm(coords):
+    """openh-rf per-pixel coordinates (z, x, 3) with last axis [x, y, z] in
+    metres -> mpl imshow extent [left, right, bottom, top] in mm."""
+    x = coords[..., 0]
+    z = coords[..., 2]
+    return [x.min() * 1e3, x.max() * 1e3, z.max() * 1e3, z.min() * 1e3]
 
 
 def main():
@@ -68,13 +71,12 @@ def main():
         scan = f.scan()
         raw = f.data.raw_data[:]
         img = f.data.image.values[:]
-        img_ext = f.data.image.extent[:]
+        img_coords = f.data.image.coordinates[:]
         focused = f.data.bmode_focused.values[:]
-        focused_ext = f.data.bmode_focused.extent[:]
+        focused_coords = f.data.bmode_focused.coordinates[:]
         sos = f.data.sos_map.values[:]
-        sos_ext = f.data.sos_map.extent[:]
+        sos_coords = f.data.sos_map.coordinates[:]
         seg = f.data.segmentation.values[:]
-        seg_ext = f.data.segmentation.extent[:]
         labels = f.data.segmentation.labels.asstr()[:]
         phase_err = f.metrics().common_midpoint_phase_error
 
@@ -111,9 +113,10 @@ def main():
     print(f"sos shape: {sos.shape}")
     # Handle different possible sos shapes: (frames, nz, nx) or (frames, nz, nx, 1)
     sos_frame = sos[0] if sos.ndim == 3 else sos[0, :, :, 0]
-    nz_sos, nx_sos = sos_frame.shape[0], sos_frame.shape[1]
-    sos_grid_x = np.linspace(sos_ext[0], sos_ext[1], nx_sos, dtype=np.float32)
-    sos_grid_z = np.linspace(sos_ext[4], sos_ext[5], nz_sos, dtype=np.float32)
+    # sos_coords is (nz, nx, 3) with last axis [x, y, z]: x varies along axis 1,
+    # z along axis 0.
+    sos_grid_x = np.ascontiguousarray(sos_coords[0, :, 0], dtype=np.float32)
+    sos_grid_z = np.ascontiguousarray(sos_coords[:, 0, 2], dtype=np.float32)
 
     params_sos = params.copy()
     params_sos["sos_map"] = sos_frame
@@ -136,21 +139,23 @@ def main():
     axes[0].set_ylabel("Axial sample")
 
     # 2: Stored B-mode (DAS)
-    axes[1].imshow(img[0], aspect="auto", cmap="gray", extent=ext_to_imshow_mm(img_ext))
+    axes[1].imshow(
+        img[0], aspect="auto", cmap="gray", extent=coords_to_imshow_mm(img_coords)
+    )
     axes[1].set_title(f"B-mode (DAS, stored)\nimage: {img.shape}")
     axes[1].set_xlabel("Lateral [mm]")
     axes[1].set_ylabel("Depth [mm]")
 
     # 3: Stored DBUA
     axes[2].imshow(
-        focused[0], aspect="auto", cmap="gray", extent=ext_to_imshow_mm(focused_ext)
+        focused[0], aspect="auto", cmap="gray", extent=coords_to_imshow_mm(focused_coords)
     )
     axes[2].set_title(f"B-mode (DBUA, stored)\nbmode_focused: {focused.shape}")
     axes[2].set_xlabel("Lateral [mm]")
     axes[2].set_ylabel("Depth [mm]")
 
     # 4: zea-reconstructed B-mode (DAS pipeline on raw_data)
-    stored_ext = ext_to_imshow_mm(img_ext)
+    stored_ext = coords_to_imshow_mm(img_coords)
     axes[3].imshow(
         recon, aspect="auto", cmap="gray", vmin=-60, vmax=0, extent=recon_ext
     )
@@ -162,7 +167,7 @@ def main():
 
     # 5: SOS map
     im = axes[4].imshow(
-        sos[0], aspect="auto", cmap="hot", extent=ext_to_imshow_mm(sos_ext)
+        sos[0], aspect="auto", cmap="hot", extent=coords_to_imshow_mm(sos_coords)
     )
     plt.colorbar(im, ax=axes[4], label="m/s")
     axes[4].set_title(f"Speed of sound\nsos_map: {sos.shape}")
@@ -181,14 +186,14 @@ def main():
 
     # 7: Segmentation overlaid on focused (DBUA) B-mode
     axes[6].imshow(
-        focused[0], aspect="auto", cmap="gray", extent=ext_to_imshow_mm(focused_ext)
+        focused[0], aspect="auto", cmap="gray", extent=coords_to_imshow_mm(focused_coords)
     )
     axes[6].imshow(
-        seg[0, :, :, 0, 1],
+        seg[0, :, :, 1],  # (n_frames, z, x, n_labels); label 1 = inclusion
         aspect="auto",
         cmap="Reds",
         alpha=0.4,
-        extent=ext_to_imshow_mm(seg_ext),
+        extent=coords_to_imshow_mm(img_coords),
     )
     axes[6].set_title(f"Segmentation on DBUA\nlabels: {list(labels)}")
     axes[6].set_xlabel("Lateral [mm]")

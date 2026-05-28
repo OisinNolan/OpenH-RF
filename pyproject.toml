@@ -9,7 +9,9 @@ authors = [
     { name = "OpenH-RF Contributors" },
 ]
 dependencies = [
-    "zea==0.1.0a0", # pre-release version of zea
+    # Point-based (coordinates) data spec — tue-bmd/zea@openh-rf, pinned to a SHA
+    # for reproducibility. Update the SHA when the openh-rf spec advances.
+    "zea @ git+https://github.com/tue-bmd/zea.git@870e322258cbfb801165c8fe25c5cfe2c21e9765",
     "numpy",
     "huggingface_hub",
     "datasets",
