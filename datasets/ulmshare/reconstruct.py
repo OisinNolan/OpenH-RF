@@ -12,17 +12,17 @@ Everything is written into OUT_DIR: ``bmode.png``, ``power_doppler.png``,
 ``power_doppler_movie.gif`` and ``ulm_density.png``.
 
 Only a fraction of the acquisition is used. By default the Power-Doppler and
-ULM outputs are built from the first ``N_FRAMES`` = 50 buffers (20000 frames,
+ULM outputs are built from the first ``N_BUFFERS`` = 50 buffers (20000 frames,
 ~22 GB) of mouse_10/acquisition_1, an acquisition of 160000 frames (~178 GB),
 streamed from the Hub. That gives a recognisable vascular map, though sparser
 than the one in the ULMShare paper. Far fewer frames is not much use for ULM:
 the first buffers are typically recorded before the microbubble bolus arrives,
 so their density map is near-empty. To reproduce the paper, set
-``N_FRAMES = None`` to use all frames, streamed or from a local copy (point
+``N_BUFFERS = None`` to use all frames, streamed or from a local copy (point
 ``ZEA_FILE`` at it).
 
-The frames are processed one 400-frame acquisition buffer at a time -- stream,
-beamform, SVD clutter filter, localize, track -- so memory stays flat however
+The frames are processed one acquisition buffer (``custom/nb_acq`` frames) at a
+time -- stream, beamform, SVD clutter filter, localize, track -- so memory stays flat however
 many frames are used, and the next buffer is read while the current one is
 processed. Each stage's output is checkpointed per buffer under zea's cache
 directory (``CHECKPOINT_DIR``), so an interrupted run resumes, and re-running
@@ -71,7 +71,9 @@ from zea.ops import (
     TissueSuppression,
 )
 
-# ULMShare reference beamforming grid (example_script_one_buffer / process.m).
+# Beamforming grid: ULMShare's 25 um pitch (example_script_one_buffer / process.m),
+# over 12 x 11 mm rather than the example script's 10 x 8 mm, so it covers the whole
+# brain section, as the maps published with the dataset do.
 #
 # MATLAB's axes are ``startX:deltaGrid:endX-deltaGrid``: an exact 25 um pitch
 # stopping one pitch short of the nominal end. zea's ``linspace(lim0, lim1, n)``
@@ -80,13 +82,13 @@ from zea.ops import (
 # handed to MATLAB via export_for_matlab. So the limits passed to zea are the
 # MATLAB grid's *last sample* (LAST_X/LAST_Z), while END_X/END_Z stay the nominal
 # span for matplotlib's extent (which wants outer pixel edges).
-START_X, END_X = -0.5e-2, 0.5e-2  # m
-START_Z, END_Z = 0.05e-2, 0.85e-2  # m
+START_X, END_X = -0.6e-2, 0.6e-2  # m
+START_Z, END_Z = 0.05e-2, 1.15e-2  # m
 DELTA_GRID = 2.5e-5  # m
-GRID_SIZE_X = int(round((END_X - START_X) / DELTA_GRID))  # 400
-GRID_SIZE_Z = int(round((END_Z - START_Z) / DELTA_GRID))  # 320
-LAST_X = START_X + (GRID_SIZE_X - 1) * DELTA_GRID  # 4.975 mm
-LAST_Z = START_Z + (GRID_SIZE_Z - 1) * DELTA_GRID  # 8.475 mm
+GRID_SIZE_X = int(round((END_X - START_X) / DELTA_GRID))  # 480
+GRID_SIZE_Z = int(round((END_Z - START_Z) / DELTA_GRID))  # 440
+LAST_X = START_X + (GRID_SIZE_X - 1) * DELTA_GRID  # 5.975 mm
+LAST_Z = START_Z + (GRID_SIZE_Z - 1) * DELTA_GRID  # 11.475 mm
 EXTENT_MM = [START_X * 1e3, END_X * 1e3, END_Z * 1e3, START_Z * 1e3]
 FNUMBER = 1.4
 
@@ -111,33 +113,43 @@ AXIAL_UPSAMPLING = 4
 STREAM_BLOCK_BYTES = 64 * 2**20
 CLUTTER_FILTER_CUT = 5 / 100  # SVD cutoff as a fraction of frames (process.m)
 T_PEAK = 0.0  # MUST adds no pulse-peak offset; zea's default images too deep
-# ULMShare records 400-frame buffers, concatenated by convert_acquisition. The
-# clutter filter runs per buffer as the reference MATLAB does -- and a
-# 1600-frame Casorati SVD does not fit in GPU memory anyway.
-FRAMES_PER_BUFFER = 400
-# Stage checkpoints (see "Checkpoints" below). The beamformed stage is the big
-# one, ~1 MB per frame (~20 GB at the default N_FRAMES); set ZEA_CACHE_DIR to put
-# it on a larger disk, or CHECKPOINT = False to keep nothing.
+# ULMShare records buffers of custom/nb_acq frames (400 to 1000), concatenated by
+# convert_acquisition. The clutter filter and ULM run per buffer, as the reference
+# MATLAB does; files without nb_acq (not yet fixed, open-h/Open-H-RF#59) fall back
+# to this.
+DEFAULT_FRAMES_PER_BUFFER = 400
+# Stage checkpoints (see "Checkpoints" below): a few MB per buffer, the beamformed
+# frames are not kept. CHECKPOINT = False keeps nothing.
 CHECKPOINT = True
 CHECKPOINT_DIR = ZEA_CACHE_DIR / "ulmshare"
 
 # ULM parameters (see ulm.py), in beamforming-grid pixels (25 um) and frames
-# (1 ms). After the bolus the filtered movie is a dense cloud of overlapping
-# bubbles whose interference flickers from frame to frame; only isolated bubbles
-# stand out and persist. So a bubble is a local maximum well above the typical
-# level at its depth, and it is kept only if it can be followed for a while.
-# Buffers where the tissue moves (breathing, heartbeat, the probe) leave clutter
-# that the SVD filter does not remove and that tracks into false vessels; ULM
-# skips a buffer whose tissue image decorrelates below this within it (see
-# ulm.tissue_stability). Still buffers score > 0.98, moving ones 0.85-0.92.
-ULM_MIN_TISSUE_CORR = 0.95
-ULM_THRESHOLD = 3.0  # detection floor, as a multiple of the depth row's median |IQ|
-ULM_MIN_DISTANCE = 2  # local-maximum half-width (~half the PSF)
-ULM_MAX_LINKING_DISTANCE = 3.0  # max jump from a track's last position (75 um)
+# (1 ms), except the three spatial scales marked "wavelengths": a bubble's image
+# grows with the wavelength (the GE probe's is 1.5x the Verasonics probes'), so
+# those are set from the file's centre frequency (ulm_scales). On the Verasonics
+# probes (99 um) they come to TAL's 4 px scale, 2 px and 3 px.
+#
+# After the bolus the filtered movie is a dense cloud of overlapping
+# bubbles whose interference flickers from frame to frame. As ULMShare's own chain
+# (example_script.m with TAL), the movie is first enhanced by lag-1 autocorrelation,
+# then a spatio-temporal vesselness filter marks where something bright moves
+# coherently through (z, x, t); a bubble is a local maximum inside that mask and
+# above a floor set from the noise (not from the bubble cloud, so buffers before
+# the bolus stay near-empty), and it is kept only if it can be followed for a while.
+ULM_LAG1_WINDOW = 7  # Hanning window (frames) of the lag-1 enhancement (example_script.m)
+ULM_VESSEL_SIGMA = 1.0  # vesselness scale, wavelengths (as pixels, also frames)
+ULM_VESSEL_EPSILON = 1.4  # weight of space against time in the Hessian (TAL default)
+ULM_VESSEL_TAU = 0.4  # vesselness response uniformity (TAL config.json)
+ULM_VESSEL_THRESHOLD = 0.005  # mask: vesselness above this
+ULM_THRESHOLD = 2.0  # detection floor, as a multiple of the depth row's noise (ulm.noise_floor)
+ULM_MIN_DISTANCE = 0.5  # local-maximum half-width, wavelengths (~half the PSF)
+ULM_MAX_LINKING_DISTANCE = 0.75  # max jump from a track's last position, wavelengths
 ULM_MAX_GAP = 5  # frames a track may go undetected before it ends
 ULM_MIN_TRACK_LENGTH = 10  # detections a track needs to count
 ULM_SMOOTH = 9  # moving-average window (frames) along a track before rendering
 ULM_SUPER_RES = 4  # density-map pixels per BF pixel per axis (6.25 um)
+ULM_BLACK_LEVEL = 0.25  # display black level, as a fraction of the in-brain median count
+ULM_GAMMA = 0.4  # display gamma, applied after the black level
 
 # --- Inputs -----------------------------------------------------------------
 # Defaults stream straight from the published corpus. Swap any of these for a
@@ -145,10 +157,10 @@ ULM_SUPER_RES = 4  # density-map pixels per BF pixel per axis (6.25 um)
 ZEA_FILE = "hf://nvidia/Open-H-RF/ulmshare/data/mouse_10_acquisition_1_zea.hdf5"
 OUT_DIR = Path(__file__).parent  # Directory for all outputs (default: next to this script)
 FRAME = 0  # B-mode frame index (default: 0)
-# mouse_10/acquisition_1 is ~178 GB / 160000 frames; `None` means all of them,
-# which is best done from a local copy. 50 buffers is ~22 GB streamed; see the
+# mouse_10/acquisition_1 is ~178 GB / 400 buffers of 400 frames; `None` means all of
+# them, which is best done from a local copy. 50 buffers is ~22 GB streamed; see the
 # module docstring.
-N_FRAMES = 50 * FRAMES_PER_BUFFER  # frames used for Power-Doppler and ULM
+N_BUFFERS = 50  # buffers used for Power-Doppler and ULM
 
 
 def build_pipeline():
@@ -259,10 +271,28 @@ def _apply_ulmshare_grid(parameters):
     return parameters
 
 
+def ulm_scales(parameters):
+    """The wavelength-scaled ULM parameters of one acquisition, in grid pixels."""
+    wavelength = float(parameters.sound_speed) / float(parameters.center_frequency)
+    px = wavelength / DELTA_GRID
+    return {
+        "vessel_sigma": ULM_VESSEL_SIGMA * px,
+        "min_distance": max(1, int(round(ULM_MIN_DISTANCE * px))),
+        "max_linking_distance": ULM_MAX_LINKING_DISTANCE * px,
+    }
+
+
 def count_frames(zea_path):
-    """Number of frames in the raw-data track of ``zea_path``."""
+    """``(n_frames, frames_per_buffer)`` of the raw-data track of ``zea_path``."""
     with zea.File(str(zea_path)) as f:
-        return _raw_source(f).data.raw_data.shape[0]
+        n_frames = _raw_source(f).data.raw_data.shape[0]
+        if "custom" in f and "nb_acq" in f["custom"]:
+            return n_frames, int(f["custom/nb_acq"][()])
+    zea.log.warning(
+        f"No custom/nb_acq in {zea_path} (a file not yet fixed for open-h/Open-H-RF#59): "
+        f"assuming {DEFAULT_FRAMES_PER_BUFFER}-frame buffers."
+    )
+    return n_frames, DEFAULT_FRAMES_PER_BUFFER
 
 
 def log_settings(n_total, n_used):
@@ -274,15 +304,13 @@ def log_settings(n_total, n_used):
     pct = 100 * n_used / n_total
     zea.log.info(f"  PD/ULM:       {n_used}/{n_total} frames ({pct:.1f}% of the acquisition)")
     if checkpoints_enabled():
-        # Beamformed IQ: float32 I and Q per grid pixel, per frame.
-        size_gb = n_used * GRID_SIZE_Z * GRID_SIZE_X * 2 * 4 / 1e9
-        zea.log.info(f"  checkpoints:  {zea.log.yellow(CHECKPOINT_DIR)} (up to ~{size_gb:.1f} GB)")
+        zea.log.info(f"  checkpoints:  {zea.log.yellow(CHECKPOINT_DIR)}")
     else:
         zea.log.info("  checkpoints:  off")
     if n_used < n_total:
         zea.log.warning(
             "Using only part of the acquisition: the ULM map will be much sparser than in "
-            "the ULMShare paper. Set N_FRAMES = None (on a local copy) to use all frames."
+            "the ULMShare paper. Set N_BUFFERS = None (on a local copy) to use all frames."
         )
 
 
@@ -396,13 +424,14 @@ def power_doppler_stats(iq_cf, n_movie):
 # --- Checkpoints ----------------------------------------------------------------
 # Every buffer's stage outputs are saved under zea's cache directory (see
 # CHECKPOINT_DIR), so a crashed or re-tuned run resumes where it can: changing a
-# ULM parameter reuses the beamformed and filtered stages, and a buffer whose
-# outputs are all saved is not streamed again. Each key holds the input file, the
+# tracking parameter reuses the localizations, and a buffer whose outputs are all
+# saved is not streamed again. The beamformed frames are not kept (~1 MB per frame),
+# so any other change beamforms the buffer again. Each key holds the input file, the
 # buffer, every setting of its stage and the ones before it, and the source code
 # of the functions that compute it, so any change recomputes what it affects.
 
 
-def stage_keys(zea_file, start, stop, pipeline_yaml):
+def stage_keys(zea_file, start, stop, pipeline_yaml, scales):
     """Checkpoint keys of one buffer's stages, each extending the previous one."""
     src = get_function_source
     bf = [zea_file, start, stop, pipeline_yaml, START_X, LAST_X, START_Z, LAST_Z]
@@ -411,10 +440,13 @@ def stage_keys(zea_file, start, stop, pipeline_yaml):
     cf = bf + [CLUTTER_FILTER_CUT, src(clutter_filter), src(matlab_clutter_cutoff)]
     n_movie = max(0, min(stop, MOVIE_MAX_FRAMES) - start)
     pd = cf + [n_movie, src(power_doppler_stats)]
-    loc = cf + [ULM_MIN_TISSUE_CORR, src(ulm.tissue_stability), ULM_THRESHOLD, ULM_MIN_DISTANCE]
-    loc += [src(ulm.localize)]
-    trk = loc + [ULM_MAX_LINKING_DISTANCE, ULM_MAX_GAP, ULM_MIN_TRACK_LENGTH, src(ulm.track)]
-    keys = {"beamformed": bf, "power_doppler": pd, "localizations": loc, "tracks": trk}
+    loc = cf + [ULM_LAG1_WINDOW, src(ulm.lag1), scales["vessel_sigma"], ULM_VESSEL_EPSILON]
+    loc += [ULM_VESSEL_TAU, ULM_VESSEL_THRESHOLD, src(ulm.vesselness), src(ulm._filter_axis)]
+    loc += [ULM_THRESHOLD, scales["min_distance"], src(ulm.noise_floor), src(ulm.localize)]
+    loc += [src(localize_buffer)]
+    trk = loc + [scales["max_linking_distance"], ULM_MAX_GAP, ULM_MIN_TRACK_LENGTH]
+    trk += [src(ulm.track)]
+    keys = {"power_doppler": pd, "localizations": loc, "tracks": trk}
     return {stage: CHECKPOINT_DIR / f"{stage}_{hash_elements(k)}.pkl" for stage, k in keys.items()}
 
 
@@ -442,57 +474,60 @@ def has_checkpoint(path):
     return checkpoints_enabled() and path.exists()
 
 
-def process_buffer(paths, raw, head, inputs, op, n_movie, status):
+def localize_buffer(iq_cf, scales):
+    """Bubble positions in every frame of one filtered buffer (see the ULM parameters).
+
+    Lag-1 enhancement, then local maxima inside the spatio-temporal vesselness mask.
+    The enhancement averages neighbouring frame pairs, so a buffer of n frames
+    gives n - 1 localization frames.
+    """
+    noise = ulm.noise_floor(iq_cf)
+    mag = ulm.lag1(iq_cf, ULM_LAG1_WINDOW)
+    mask = ulm.vesselness(mag, scales["vessel_sigma"], ULM_VESSEL_EPSILON, ULM_VESSEL_TAU)
+    mask = mask > ULM_VESSEL_THRESHOLD
+    return ulm.localize(mag, ULM_THRESHOLD, scales["min_distance"], mask=mask, noise=noise)
+
+
+def process_buffer(paths, raw, head, inputs, op, n_movie, scales, status):
     """Run one buffer through beamform -> filter -> localize -> track.
 
     Loads each stage from its checkpoint where one exists and computes (and
-    saves) it otherwise. ``raw`` is only needed when the beamformed stage is not
+    saves) it otherwise; ``raw`` is only needed when a stage before tracking is not
     saved. Returns ``(power_doppler_stats, tracks)``, where ``tracks`` holds the
-    buffer's ``tracks``, its ``n_localizations`` and whether its tissue ``moved``.
+    buffer's ``tracks`` and its ``n_localizations``.
     """
     pd = load_checkpoint(paths["power_doppler"])
     tracks = load_checkpoint(paths["tracks"])
     loc = None if tracks is not None else load_checkpoint(paths["localizations"])
     if pd is None or (tracks is None and loc is None):
-        iq_bf = load_checkpoint(paths["beamformed"])
-        if iq_bf is None:
-            status("beamform")
-            iq_bf = beamform(raw, head, inputs)
-            save_checkpoint(paths["beamformed"], iq_bf)
-        need_loc = tracks is None and loc is None
-        still = need_loc and ulm.tissue_stability(iq_bf) >= ULM_MIN_TISSUE_CORR
+        status("beamform")
+        iq_bf = beamform(raw, head, inputs)
         status("filter")
         iq_cf = clutter_filter(iq_bf, op)
         del iq_bf
         if pd is None:
             pd = power_doppler_stats(iq_cf, n_movie)
             save_checkpoint(paths["power_doppler"], pd)
-        if need_loc:
+        if tracks is None and loc is None:
             status("localize")
-            # A buffer whose tissue moved gets no localizations (see ulm.tissue_stability).
-            if still:
-                locs = ulm.localize(iq_cf, threshold=ULM_THRESHOLD, min_distance=ULM_MIN_DISTANCE)
-            else:
-                locs = [np.zeros((0, 2))] * len(iq_cf)
-            loc = {"locs": locs, "moved": not still}
+            loc = {"locs": localize_buffer(iq_cf, scales)}
             save_checkpoint(paths["localizations"], loc)
     if tracks is None:
         status("track")
         tracks = {
             "tracks": ulm.track(
                 loc["locs"],
-                max_linking_distance=ULM_MAX_LINKING_DISTANCE,
+                max_linking_distance=scales["max_linking_distance"],
                 max_gap=ULM_MAX_GAP,
                 min_length=ULM_MIN_TRACK_LENGTH,
             ),
             "n_localizations": sum(len(p) for p in loc["locs"]),
-            "moved": loc["moved"],
         }
         save_checkpoint(paths["tracks"], tracks)
     return pd, tracks
 
 
-def process_acquisition(zea_path, ts_pipeline, pipeline_yaml, n_frames):
+def process_acquisition(zea_path, ts_pipeline, pipeline_yaml, n_frames, frames_per_buffer):
     """Stream and process ``n_frames`` frames one acquisition buffer at a time.
 
     Only one buffer (plus the next one being read) is held in memory, so memory
@@ -500,44 +535,52 @@ def process_acquisition(zea_path, ts_pipeline, pipeline_yaml, n_frames):
     on a background thread while the current one is processed, and buffers whose
     stages are all checkpointed are not read at all.
 
-    Returns ``(pd_sum, peak, movie_mag, tracks, n_localizations, n_moved)``,
-    accumulated over all buffers (``n_moved``: buffers ULM skipped for motion).
+    Returns ``(pd_sum, peak, movie_mag, tracks, n_localizations)``, accumulated
+    over all buffers.
     """
     # TissueSuppression works across frames, so the pipeline is split: its
     # Cast -> Beamform head runs per batch of frames, the op itself per buffer.
     head, op = split_pipeline(ts_pipeline, TissueSuppression)
     with zea.File(str(zea_path)) as f:
         source = _raw_source(f)
-        inputs = head.prepare_parameters(_apply_ulmshare_grid(source.load_parameters()))
+        parameters = source.load_parameters()
+        scales = ulm_scales(parameters)
+        inputs = head.prepare_parameters(_apply_ulmshare_grid(parameters))
         dataset_name = source.data.raw_data.name
         chunks, itemsize = source.data.raw_data.chunks, source.data.raw_data.dtype.itemsize
     # An uncompressed frame chunk: an upper bound on what one stored frame takes.
     frame_bytes = int(np.prod(chunks)) * itemsize
 
     buffers = [
-        (start, min(start + FRAMES_PER_BUFFER, n_frames))
-        for start in range(0, n_frames, FRAMES_PER_BUFFER)
+        (start, min(start + frames_per_buffer, n_frames))
+        for start in range(0, n_frames, frames_per_buffer)
     ]
-    paths = [stage_keys(str(zea_path), start, stop, pipeline_yaml) for start, stop in buffers]
+    zea.log.info(
+        "  ULM scales:   vesselness sigma {vessel_sigma:.2f} px, min distance {min_distance} px, "
+        "linking {max_linking_distance:.2f} px".format(**scales)
+    )
+    paths = [
+        stage_keys(str(zea_path), start, stop, pipeline_yaml, scales) for start, stop in buffers
+    ]
 
     def needs_raw(p):
         done = has_checkpoint(p["power_doppler"]) and (
             has_checkpoint(p["tracks"]) or has_checkpoint(p["localizations"])
         )
-        return not done and not has_checkpoint(p["beamformed"])
+        return not done
 
     to_read = [i for i, p in enumerate(paths) if needs_raw(p)]
     n_cached = len(buffers) - len(to_read)
     if n_cached:
         zea.log.info(f"  {n_cached}/{len(buffers)} buffers resume from checkpoints")
 
-    pd_sum, peak, movie, tracks, n_loc, n_moved = 0.0, 0.0, [], [], 0, 0
+    pd_sum, peak, movie, tracks, n_loc = 0.0, 0.0, [], [], 0
     verb = "streaming" if str(zea_path).startswith("hf://") else "reading"
     with ExitStack() as stack:
         pool = stack.enter_context(ThreadPoolExecutor(max_workers=1))
         pending = {}
         if to_read:
-            block_bytes = FRAMES_PER_BUFFER * frame_bytes
+            block_bytes = frames_per_buffer * frame_bytes
             raw_data = stack.enter_context(open_raw_data(zea_path, dataset_name, block_bytes))
 
             def prefetch(i):
@@ -557,7 +600,7 @@ def process_acquisition(zea_path, ts_pipeline, pipeline_yaml, n_frames):
                 prefetch(to_read.index(i) + 1)  # read the next buffer meanwhile
             n_movie = max(0, min(stop, MOVIE_MAX_FRAMES) - start)
             pd, buf = process_buffer(
-                paths[i], raw, head, inputs, op, n_movie, progbar.set_postfix_str
+                paths[i], raw, head, inputs, op, n_movie, scales, progbar.set_postfix_str
             )
             pd_sum = pd_sum + pd["sum"]
             peak = max(peak, pd["peak"])
@@ -565,11 +608,10 @@ def process_acquisition(zea_path, ts_pipeline, pipeline_yaml, n_frames):
                 movie.append(pd["movie"])
             tracks.extend(t + np.float32([start, 0, 0]) for t in buf["tracks"])  # global frames
             n_loc += buf["n_localizations"]
-            n_moved += buf["moved"]
             progbar.update(stop - start)
 
     movie = np.concatenate(movie, axis=0) if movie else None
-    return pd_sum, peak, movie, tracks, n_loc, n_moved
+    return pd_sum, peak, movie, tracks, n_loc
 
 
 def save_image(image, out_path, title, label, cmap, vmin=None, vmax=None, ticks=None):
@@ -607,21 +649,42 @@ def save_movie_gif(movie, out_path, vmin, vmax, cmap="viridis", fps=MOVIE_FPS):
     save_to_gif(np.stack(frames), out_path, fps=fps)  # logs the saved path itself
 
 
-def render_ulm(density, out_path, super_res=ULM_SUPER_RES):
-    """Render a ULM density map to a PNG.
+def ulm_display(density, super_res=ULM_SUPER_RES):
+    """Tone-map a ULM density map for display: blur, black level, then gamma.
 
-    A light blur makes the sparse splatted counts read as vessels and a gamma < 1
-    keeps faint vessels visible; ``vmax`` comes from non-empty cells so the
-    mostly-zero background does not collapse the scale. Sigma is specified in BF
-    pixels so the look is stable as ``super_res`` changes.
+    A light blur makes the sparse splatted counts read as vessels. Stray tracks
+    leave a low, roughly even count everywhere in the brain, so a fraction of the
+    in-brain median count is subtracted as a black level; a gamma then evens out
+    fast and slow vessels. Both constants were fitted once against ULMShare's own
+    maps (SSIM, L1, MSE and intensity histograms on three probes) and are global.
+    Sigma is in BF pixels so the look is stable as ``super_res`` changes.
     """
-    disp = gaussian_filter(density, sigma=0.1 * super_res) ** 0.5
+    blurred = gaussian_filter(density, sigma=0.1 * super_res)
+    # Brain = where the count, averaged over ~1 mm, is a sizeable fraction of its peak
+    # (computed on 0.1 mm blocks for speed).
+    block = max(1, int(round(1e-4 / (DELTA_GRID / super_res))))
+    h, w = (s // block * block for s in blurred.shape)
+    coarse = blurred[:h, :w].reshape(h // block, block, w // block, block).mean((1, 3))
+    coarse = gaussian_filter(coarse, sigma=1e-3 / (block * DELTA_GRID / super_res))
+    brain = np.zeros(blurred.shape, bool)
+    brain[:h, :w] = np.kron(coarse > 0.3 * coarse.max(), np.ones((block, block), bool))
+    floor = ULM_BLACK_LEVEL * np.median(blurred[brain]) if brain.any() else 0.0
+    return np.maximum(blurred - floor, 0) ** ULM_GAMMA
+
+
+def render_ulm(density, out_path, super_res=ULM_SUPER_RES):
+    """Render a ULM density map to a PNG (see ``ulm_display`` for the tone curve).
+
+    ``vmax`` comes from non-empty cells so the mostly-zero background does not
+    collapse the scale.
+    """
+    disp = ulm_display(density, super_res)
     nonzero = disp[disp > 0]
     save_image(
         disp,
         out_path,
         title="ULM density map",
-        label="sqrt(count)",
+        label=f"(count - {ULM_BLACK_LEVEL} median)^{ULM_GAMMA}",
         cmap="hot",
         vmin=0,
         vmax=np.percentile(nonzero, 99) if nonzero.size else 1.0,
@@ -633,8 +696,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     zea.init_device(verbose=False)
 
-    n_total = count_frames(ZEA_FILE)
-    n_used = n_total if N_FRAMES is None else min(N_FRAMES, n_total)
+    n_total, frames_per_buffer = count_frames(ZEA_FILE)
+    n_used = n_total if N_BUFFERS is None else min(N_BUFFERS * frames_per_buffer, n_total)
     log_settings(n_total, n_used)
     bmode_yaml = out_dir / "pipeline_bmode.yaml"
     ts_yaml = out_dir / "pipeline_tissue_suppression.yaml"
@@ -667,13 +730,13 @@ def main():
     # ---- Power-Doppler + ULM, one buffer at a time ------------------------- #
     source = "streaming from the Hub" if ZEA_FILE.startswith("hf://") else "reading from disk"
     zea.log.info(
-        f"Processing {n_used} frames ({source}), per {FRAMES_PER_BUFFER}-frame buffer: "
+        f"Processing {n_used} frames ({source}), per {frames_per_buffer}-frame buffer: "
         "beamform -> SVD filter -> localize -> track ..."
     )
-    cut = matlab_clutter_cutoff(FRAMES_PER_BUFFER)
-    zea.log.info(f"  SVD clutter filter rejects {cut} of {FRAMES_PER_BUFFER} components per buffer")
-    pd_sum, peak, movie_mag, tracks, n_loc, n_moved = process_acquisition(
-        ZEA_FILE, ts_pipeline, ts_yaml.read_text(), n_used
+    cut = matlab_clutter_cutoff(frames_per_buffer)
+    zea.log.info(f"  SVD clutter filter rejects {cut} of {frames_per_buffer} components per buffer")
+    pd_sum, peak, movie_mag, tracks, n_loc = process_acquisition(
+        ZEA_FILE, ts_pipeline, ts_yaml.read_text(), n_used, frames_per_buffer
     )
 
     pd = 20 * np.log10(pd_sum + 1e-12)
@@ -703,13 +766,13 @@ def main():
     # ---- ULM density map ---------------------------------------------------- #
     n_points = sum(len(t) for t in tracks)
     zea.log.info(
-        f"ULM: {n_moved}/{len(range(0, n_used, FRAMES_PER_BUFFER))} buffers skipped for tissue "
-        f"motion; {n_loc} localizations -> {len(tracks)} tracks "
+        f"ULM: {n_loc} localizations -> {len(tracks)} tracks "
         f"(>= {ULM_MIN_TRACK_LENGTH} frames, {n_points} points); building the density map ..."
     )
     density = ulm.density_map(
         tracks, (GRID_SIZE_Z, GRID_SIZE_X), super_res=ULM_SUPER_RES, smooth=ULM_SMOOTH
     )
+    np.save(out_dir / "density.npy", density)  # raw counts, for compare_reference.py
     render_ulm(density, out_dir / "ulm_density.png")
 
 
